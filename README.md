@@ -1,6 +1,7 @@
 # GraphInflu
 
-### Run Baseline
+### Baseline
+#### source ratio: 0.3(random)
 ```bash
 python -u main.py \
     --lr 3e-3\
@@ -16,8 +17,24 @@ python -u main.py \
     --source_ratio 0.3 \
 ```
 
-### Run GraphInflu
+#### source ratio: 1.0
+```bash
+python -u main.py \
+    --lr 3e-3\
+    --source "dblpv7" \
+    --target  "acmv9"\
+    --seed 200\
+    --wandb 0 \
+    --wandb_info D2A-baseline\
+    --target_shots 5 \
+    --batch_size 256\
+    --device cuda:1\
+    --epochs 30 \
+    --source_ratio 1.0 \
+```
 
+### Run GraphInflu
+#### source ratio: 0.3 (based on contribution score)
 ```bash
 python -u main.py \
     --lr 3e-3\
