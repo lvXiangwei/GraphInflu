@@ -1,0 +1,173 @@
+import numpy as np
+import contextlib
+import torch
+# from udagcn.dual_gnn.dataset.DomainData import DomainData
+from semigcl.utils import load_data
+from semigcl.model import SemiGCL
+from semigcl.utils import batch_generator
+
+@contextlib.contextmanager
+def temp_seed(seed):
+    state = np.random.get_state()
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        yield
+    finally:
+        np.random.set_state(state)
+        
+        
+def get_source_dataset(model, source, source_ratio=1.0, use_source_score=0, score_path=None, seed=200):
+    '''
+    return: 
+        source.source_mask: 指代用于train的数据
+    '''
+    
+    adj_s, adj_val_s, diff_idx_s, diff_val_s, feature_s, label_s, idx_train_s, _, _, idx_tot_s = load_data(dataset=f"{source}.mat", 
+                            device="cpu", 
+                            seed=seed,
+                            alpha_ppr=0.1,
+                            diff_k=20
+                        )
+    source_data = {}
+    source_data["adj_s"] = adj_s
+    source_data["adj_val_s"] = adj_val_s
+    source_data["diff_idx_s"] = diff_idx_s
+    source_data["diff_val_s"] = diff_val_s
+    source_data["feature_s"] = feature_s
+    source_data["label_s"] = label_s
+    source_data["idx_train_s"] = idx_train_s
+
+    idx_tot_s_tmp = idx_tot_s # 为了在train 上evaluate
+    if not use_source_score:
+        source_train_num = int(len(idx_tot_s) * source_ratio)
+        idx_tot_s = idx_tot_s[:source_train_num] 
+        source_data["idx_tot_s"] = idx_tot_s
+        return source_data
+    
+    else:
+        source_data["idx_tot_s"] = idx_tot_s
+        source_data = get_source_idx(model, source, source_data, 
+                                                    score_path, 
+                                                    source_ratio)
+    return source_data
+    
+
+def get_structure_score(query, protoemb):
+    distances = torch.cdist(query.unsqueeze(1), protoemb.unsqueeze(0)).squeeze(1) # (N, C)
+    # 每行取最小值作为每个查询样本的得分
+    scores = torch.min(distances, dim=1).values
+    return scores
+    
+        
+def get_target_dataset(model, target, target_shots=None, seed=200):
+    '''
+    return: 
+        target.train_mask: 指代用于train的数据
+        target.test_mask: 指代用于test的数据
+    '''
+
+    adj_t, adj_val_t, diff_idx_t, diff_val_t, feature_t, label_t, idx_train_t, idx_val_t, idx_test_t, idx_tot_t = load_data(dataset=f"{target}.mat", 
+                            device="cpu", 
+                            shot=target_shots,
+                            seed=seed,
+                            alpha_ppr=0.1,
+                            diff_k=20
+                        )
+    num_class = label_t.shape[1]
+    target_data = {}
+    target_data["adj_t"] = adj_t
+    target_data["adj_val_t"] = adj_val_t
+    target_data["diff_idx_t"] = diff_idx_t
+    target_data["diff_val_t"] = diff_val_t
+    target_data["feature_t"] = feature_t
+    target_data["label_t"] = label_t
+    target_data["idx_train_t"] = idx_train_t
+    target_data["idx_val_t"] = idx_val_t
+    target_data["idx_test_t"] = idx_test_t
+    target_data["idx_tot_t"] = idx_tot_t
+        
+    assert (len(idx_train_t)== num_class * target_shots)
+    return target_data
+        
+    
+    
+def load_model(num_features, num_class, args):
+    model = SemiGCL(num_features, num_class, args)
+    return model
+    
+    
+def create_optim(model, args):
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    return optimizer
+      
+        
+def get_source_idx(model, dataname, data, score_path, select_ratio=1.0):
+
+    score = torch.load(score_path)  # score: [num_data, num_class * few_shots]
+            
+    labels = data['label_s'].argmax(1)
+    _, origin = torch.unique(data['label_s'].argmax(1), return_counts=True)
+    selected_indices = []
+
+    score = score.reshape(-1, 5, 5).sum(2).cpu()  #(8935, 5) ,将每个datapoint对应不同class的few-shots分别求和作为class score
+ 
+    score_desend = np.argsort(-score.max(1)[0], kind='stable') # descending
+    cnt_per_class = [0, 0, 0, 0, 0]
+    bound_per_class = [int(c * select_ratio) for c in origin]
+    # import ipdb; ipdb.set_trace()
+    for idx in score_desend:
+        if cnt_per_class[labels[idx]] < bound_per_class[labels[idx]]:
+            selected_indices.append(idx)
+            cnt_per_class[labels[idx]] += 1
+        else:
+            continue
+    
+    # print("origin select: ", f'{len(selected_indices)}/{score.shape[0]}={len(selected_indices)/score.shape[0]}')
+    selected_indices = list(set(selected_indices))
+    # print("After delete duplicate: ", f'{len(selected_indices)}/{score.shape[0]}={len(selected_indices)/score.shape[0]}')
+
+    data['idx_train_s'] =  data["idx_tot_s"]
+    data["idx_tot_s"] = torch.LongTensor(selected_indices)
+    
+    labels = data['label_s'][selected_indices].argmax(1)
+    
+    # unique_values, counts = torch.unique(labels, return_counts=True)
+    # for ori, cnt in zip(origin, counts):
+    #     print("class ratio", cnt/ori)
+
+    return data
+       
+ 
+def calculate_gradient_penalty(critic, x_src, x_tgt):
+    x = torch.cat([x_src, x_tgt], dim=0).requires_grad_(True)
+    x_out = critic(x)
+    grad_out = torch.ones(x_out.shape, requires_grad=False).to(x_out.device)
+
+    # Get gradient w.r.t. x
+    grad = torch.autograd.grad(outputs=x_out,
+                               inputs=x,
+                               grad_outputs=grad_out,
+                               create_graph=True,
+                               retain_graph=True,
+                               only_inputs=True,)[0]
+    grad = grad.view(grad.shape[0], -1)
+    grad_penalty = torch.mean((grad.norm(2, dim=1) - 1) ** 2)
+    return grad_penalty
+
+   
+def normalize(d):
+    d_reshaped = d.view(d.shape[0], -1, *(1 for _ in range(d.dim() - 2)))
+    d /= torch.norm(d_reshaped, dim=1, keepdim=True) + 1e-8
+    return d
+
+@contextlib.contextmanager
+def disable_tracking_bn_stats(model):
+
+    def switch_attr(m):
+        if hasattr(m, 'track_running_stats'):
+            m.track_running_stats ^= True
+            
+    model.apply(switch_attr)
+    yield
+    model.apply(switch_attr)
