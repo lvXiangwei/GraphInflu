@@ -171,3 +171,74 @@ def disable_tracking_bn_stats(model):
     model.apply(switch_attr)
     yield
     model.apply(switch_attr)
+    
+    
+###### 
+
+def prune(dist, beta=0.1):
+    # Calculate minimum and maximum scores along the last two dimensions
+    # min_score = torch.min(dist, dim=[1, 2], keepdim=True).values
+    # max_score = torch.max(dist, dim=[1, 2], keepdim=True).values
+    min_score = torch.min(torch.min(dist, dim=2, keepdim=True).values, dim=1, keepdim=True).values
+    max_score = torch.max(torch.max(dist, dim=2, keepdim=True).values, dim=1, keepdim=True).values
+    # Calculate threshold
+    threshold = min_score + beta * (max_score - min_score)
+    
+    # Subtract the threshold and apply ReLU to remove negative values
+    res = dist - threshold
+    return torch.relu(res)
+
+def FGW_distance(Cs, Ct, C, beta=0.5, iteration=5, OT_iteration=20):
+    # Get T and Cst using GW_alg in PyTorch
+    
+    T, Cst = GW_alg(Cs, Ct, beta=beta, iteration=iteration, OT_iteration=OT_iteration)
+    # Calculate the Gromov-Wasserstein distance
+    GW_distance = torch.einsum('bij,bij->b', Cst, T)  # Trace of Cst @ T
+    
+    # Calculate the Wasserstein distance
+    W_distance = torch.einsum('bij,bij->b', C, T)  # Trace of C @ T
+    
+    return GW_distance, W_distance
+
+def IPOT_alg(C, beta=1, t_steps=10, k_steps=1):
+    b, n, m = C.shape
+    sigma = torch.ones(b, m, 1, device=C.device) / m  # [b, m, 1]
+    T = torch.ones(b, n, m, device=C.device)
+    A = torch.exp(-C / beta)  # [b, n, m]
+    
+    for t in range(t_steps):
+        Q = A * T  # [b, n, m]
+        for k in range(k_steps):
+            delta = 1 / (n * torch.matmul(Q, sigma))  # [b, n, 1]
+            sigma = 1 / (m * torch.matmul(Q.transpose(1, 2), delta))  # [b, m, 1]
+        
+        T = delta * Q * sigma.transpose(1, 2)  # [b, n, m]
+
+    return T
+
+def GW_alg(Cs, Ct, beta=0.5, iteration=5, OT_iteration=20):
+    bs, _, n = Cs.shape
+    _, _, m = Ct.shape
+
+    one_m = torch.ones(bs, m, 1, device=Ct.device) / m
+    one_n = torch.ones(bs, n, 1, device=Cs.device) / n
+    p = torch.ones(bs, m, 1, device=Ct.device) / m
+    q = torch.ones(bs, n, 1, device=Cs.device) / n
+    
+    # Calculate Cst using matrix multiplication
+    Cst = torch.matmul(torch.matmul(Cs**2, q), one_m.transpose(1, 2)) + \
+          torch.matmul(one_n, torch.matmul(p.transpose(1,2), (Ct**2).transpose(1, 2)))
+    
+    # Initialize gamma as the outer product of q and p
+    gamma = torch.matmul(q, p.transpose(1, 2))
+
+    for i in range(iteration):
+        tmp1 = torch.matmul(Cs, gamma)
+        C_gamma = Cst - 2 * torch.matmul(tmp1, Ct.transpose(1, 2))
+
+        # Apply IPOT algorithm for transport plan update
+        gamma = IPOT_alg(C_gamma, beta=beta, t_steps=OT_iteration)
+
+    Cgamma = Cst - 2 * torch.matmul(torch.matmul(Cs, gamma), Ct.transpose(1, 2))
+    
+    return gamma, Cgamma

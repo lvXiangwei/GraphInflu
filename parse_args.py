@@ -62,6 +62,8 @@ def parse_args():
     parser.add_argument("--wandb", type=int, default=0)
     parser.add_argument("--wandb_info", type=str, default="")
 
+    ######
+    parser.add_argument('--K', type=int, default=5)
     args = parser.parse_args()
 
     return args

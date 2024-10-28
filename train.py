@@ -9,7 +9,7 @@ from semigcl.utils import batch_generator, adentropy
 import numpy as np
 import torch.nn.functional as F
 from semigcl.utils import eval_iterate
-from utils import calculate_gradient_penalty, normalize, disable_tracking_bn_stats
+from utils import calculate_gradient_penalty, normalize, disable_tracking_bn_stats, FGW_distance, prune
 from tqdm import tqdm
 from torch.nn.functional import normalize
 from sklearn.neighbors import KDTree
@@ -205,6 +205,105 @@ def accuracy(output, target, topk=(1,)):
         
     return res
 
+def get_subgraph(adj_list, target_node):
+    N, max_neighbors = adj_list.shape
+    one_hop_neighbors = set(adj_list[target_node].tolist()) - {target_node}
+    two_hop_neighbors = set()
+    for node in one_hop_neighbors:
+        neighbors = set(adj_list[node].tolist()) - {node} - one_hop_neighbors - {target_node}
+        two_hop_neighbors.update(neighbors)
+    subgraph_nodes = one_hop_neighbors | two_hop_neighbors | {target_node}
+    # print(subgraph_nodes)
+    n = len(subgraph_nodes)
+    node2idx = {node: i for i, node in enumerate(subgraph_nodes)}
+    idx2node = {i: node for i, node in enumerate(subgraph_nodes)}
+    adj_matrix = torch.zeros((n, n), dtype=torch.float32)
+    for node in subgraph_nodes:
+        cur_idx = node2idx[node]  # 当前节点的索引
+        for neighbor in adj_list[node]:
+            neighbor = neighbor.item()
+            if neighbor in node2idx:
+                ngh_idx = node2idx[neighbor]
+                adj_matrix[cur_idx, ngh_idx] = 1  # 添加邻接关系
+                adj_matrix[cur_idx, ngh_idx] = 1  # 对称化
+    return adj_matrix, node2idx, idx2node
+
+def normalize_adj_tensor(adj, sparse=False, device='cuda:0'):
+    """Normalize adjacency tensor matrix.
+    """
+    # device = torch.device("cuda" if adj.is_cuda else "cpu")
+    device = torch.device(device if adj.is_cuda else "cpu")
+
+    if sparse:
+        # warnings.warn('If you find the training process is too slow, you can uncomment line 207 in deeprobust/graph/utils.py. Note that you need to install torch_sparse')
+        # TODO if this is too slow, uncomment the following code,
+        # but you need to install torch_scatter
+        # return normalize_sparse_tensor(adj)
+        adj = to_scipy(adj)
+        mx = normalize_adj(adj)
+        return sparse_mx_to_torch_sparse_tensor(mx).to(device)
+    else:
+        mx = adj + torch.eye(adj.shape[0]).to(device)
+        rowsum = mx.sum(1)
+        r_inv = rowsum.pow(-1/2).flatten()
+        r_inv[torch.isinf(r_inv)] = 0.
+        r_mat_inv = torch.diag(r_inv)
+        mx = r_mat_inv @ mx
+        mx = mx @ r_mat_inv
+    return mx
+
+class SpecPert(nn.Module):
+    def __init__(self, num_nodes):
+        super(SpecDis, self).__init__()
+        self.nnodes= num_nodes 
+        self.adj_changes = Parameter(torch.FloatTensor(int(nnodes*(nnodes-1)/2)))
+        nn.init.uniform_(self.adj_changes, 0.0, 0.001)
+        
+    def get_modifided_adj(self, adj):
+        m = torch.zeros((self.nnodes, self.nnodes)).to(self.device)
+        tril_indices = torch.tril_indices(row=self.nnodes, col=self.nnodes, offset=-1)
+        m[tril_indices[0], tril_indices[1]] = self.adj_changes
+        m = m + m.t()
+        modifided_adj = m * (1 - adj) + (1 - m) * adj
+        return modifided_adj    
+
+    def update(self, adj, steps=5, lr=50):
+        ori_adj_norm = normalize_adj_tensor(adj)
+        ori_e = torch.linalg.eigvals(ori_adj_norm)
+        eigen_norm = self.norm = torch.norm(ori_e)
+        for i in range(steps):
+            self.loss = self(adj)
+            adj_grad = torch.autograd(self.loss, self.adj_chanes)[0]
+            lr = lr / torch.sqrt(t + 1)
+            self.adj_changes.data.add_(lr * adj_grad) 
+            self.adj_changes.data.copy_(torch.clamp(self.adj_changes, min=0, max=1))
+        
+        s = self.adj_changes.cpu().detach().numpy()
+        s = np.random.binomial(1, s)
+        self.adj_changes.data.copy_(torch.tensor(s))
+        
+        self.modifided_adj = self.get_modifided_adj(adj).detach()
+        self.check_adj_tensor(self.modified_adj)
+        return modifided_adj    
+    
+    def check_adj_tensor(self, adj):
+        """Check if the modified adjacency is symmetric, unweighted, all-zero diagonal.
+        """
+        assert torch.abs(adj - adj.t()).sum() == 0, "Input graph is not symmetric"
+        assert adj.max() == 1, "Max value should be 1!"
+        assert adj.min() == 0, "Min value should be 0!"
+        diag = adj.diag()
+        assert diag.max() == 0, "Diagonal should be 0!"
+        assert diag.min() == 0, "Diagonal should be 0!"
+         
+    def forward(self, adj):
+        modifided_adj = self.get_adj(adj)
+        adj_norm = normalize_adj_tensor(modifided_adj)
+        e = torch.linalg.eigvals(adj_norm)
+        eigen_mse = torch.norm(ori_e-e)
+        loss = eigen_mse / eigen_norm
+        
+
 
 def train_epoch(model, optimizer, source_data, target_data, epoch, epochs, args):
     model.train()
@@ -249,26 +348,26 @@ def train_epoch(model, optimizer, source_data, target_data, epoch, epochs, args)
             uncertain_tgt = -1 * torch.sum(preds * torch.log(preds + 1e-10), dim=1).detach() # (N_t, )
             
             
-            # prepare random unit tensor
-            delta_h = torch.rand(h.shape).sub(0.5).to(h.device)
-            delta_h  = normalize(delta_h)
+            # # prepare random unit tensor
+            # delta_h = torch.rand(h.shape).sub(0.5).to(h.device)
+            # delta_h  = normalize(delta_h)
             
-            with disable_tracking_bn_stats(model):
-                for i in range(args.ip):
-                    delta_h.requires_grad_()
-                    preds_hat = model.cly_model(h + args.xi * delta_h)
-                    logp_hat = F.log_softmax(preds_hat, dim=1)
-                    kl_div = F.kl_div(logp_hat, preds, reduction='batchmean')
-                    kl_div.backward()
-                    delta_h = normalize(delta_h.grad)
-                    model.zero_grad()
+            # with disable_tracking_bn_stats(model):
+            #     for i in range(args.ip):
+            #         delta_h.requires_grad_()
+            #         preds_hat = model.cly_model(h + args.xi * delta_h)
+            #         logp_hat = F.log_softmax(preds_hat, dim=1)
+            #         kl_div = F.kl_div(logp_hat, preds, reduction='batchmean')
+            #         kl_div.backward()
+            #         delta_h = normalize(delta_h.grad)
+            #         model.zero_grad()
                     
-                #calulate uncertainty
-                adv_h = delta_h * args.eps
-                preds_hat = model.cly_model(h + adv_h)
-                logp_hat = F.log_softmax(preds_hat, dim=1)
-                unstable_tgt = F.kl_div(logp_hat, preds, reduction='none').sum(1).detach() # (N_t, 1)
-            unstable_tgt = torch.zeros(h_tgt.shape[0]).to(h.device)
+            #     #calulate uncertainty
+            #     adv_h = delta_h * args.eps
+            #     preds_hat = model.cly_model(h + adv_h)
+            #     logp_hat = F.log_softmax(preds_hat, dim=1)
+            #     unstable_tgt = F.kl_div(logp_hat, preds, reduction='none').sum(1).detach() # (N_t, 1)
+            # unstable_tgt = torch.zeros(h_tgt.shape[0]).to(h.device)
             # 2. 对每个source node
             # 验证  uncertainty_tgt, unstable_tgt 取值在 [0， 1]范围内
             # sorted_inx_s = torch.sort(idx_tot_s).values.cpu().numpy()
@@ -316,25 +415,47 @@ def train_epoch(model, optimizer, source_data, target_data, epoch, epochs, args)
                     ind = torch.from_numpy(ind) # （N_s, K)
                     # dist = torch.from_numpy(dist).to(b_nodes_s.device) # （N_s, K)
                     # import ipdb; ipdb.set_trace()
-                    ### 
+                    
+                    
+                    ####### distance
                     src_one_hop_neighbors = adj_s[b_nodes_s]
                     src_subgraph = torch.cat((b_nodes_s.unsqueeze(1), src_one_hop_neighbors), dim=1)
                     src_subgraph_feat = src_feat[src_subgraph] # (N_s, neighbors + 1, hiden)
-                    src_subgraph_feat = src_subgraph_feat.unsqueeze(1).repeat(1, args.K, 1, 1) # (N_s, K, neighbors + 1, hidden)
+                    K = args.K
+                    B, N, D = src_subgraph_feat.shape
+                    src_subgraph_feat = src_subgraph_feat.unsqueeze(1).repeat(1, args.K, 1, 1) # (B, K, N + 1, D)
+                    src_subgraph_feat = F.normalize(src_subgraph_feat.view(B * K, N, D), p=2, dim=-1, eps=1e-12) # (B, K, N + 1, D)
                     
                     
-                    import ipdb; ipdb.set_trace()
-                    tgt_one_hop_neighbors = adj_t[ind] # (N_s, K, neighbors)
-                    tgt_subgraph = torch.cat((ind.unsqueeze(-1).to(args.device), tgt_one_hop_neighbors), dim=-1) # (N_s, K, neighbors + 1)
-                    tgt_subgraph_feat = h[tgt_subgraph] # (N_s, K, neighbors + 1, hidden)
+                    tgt_one_hop_neighbors = adj_t[ind] # (B, K, N)
+                    tgt_subgraph = torch.cat((ind.unsqueeze(-1).to(args.device), tgt_one_hop_neighbors), dim=-1) # (B, K, N + 1, D)
+                    tgt_subgraph_feat = h[tgt_subgraph] # (B, K, N + 1, D)
+                    tgt_subgraph_feat = F.normalize(tgt_subgraph_feat.view(B * K, N, D), p=2, dim=-1, eps=1e-12) # (B, K, N + 1, D)
                     
-                    src_subgraph_feat = tgt_subgraph_feat.unsqueeze(1).repeat(1, args.K, 1, 1) # (N_s, K, neighbors + 1, hidden)
                     
                     cosine_cost = 1 - torch.einsum(
-                        'aijk,aijk->aij', src_subgraph_feat, tgt_subgraph_feat) # (N_s, K, neighbors)
+                        'aij,ajk->aik', src_subgraph_feat, tgt_subgraph_feat.transpose(1, 2)) # (B * K, N, N)
                     
-                    # C_s = 1 - torch.einsum('aijk,aijk->')
+                    Cs = 1 - torch.einsum('aij,ajk->aik', src_subgraph_feat, src_subgraph_feat.transpose(1, 2)) # (B * K, N, N)
+                    Ct = 1 - torch.einsum('aij,ajk->aik', tgt_subgraph_feat, tgt_subgraph_feat.transpose(1, 2)) # (B * K, N, N)
+                        
+                    Css = prune(Cs)
+                    Ctt = prune(Ct)
+
+                    GW_loss, W_loss = FGW_distance(Css, Ctt, cosine_cost)
+                    dis1 = GW_loss.reshape(B, K).mean(-1)
+                    dis2 = W_loss.reshape(B, K).mean(-1)
+                    dis = dis1 + dis2 # (N)
                     
+                    ########### unstability 
+                    import ipdb; ipdb.set_trace()
+                    tgt_nodes = set(ind.flatten().tolist()) # (N_s, K)
+                    uns_tgt = {i:0 for i in tgt_nodes}
+                    for node in tgt_nodes:
+                        adj, node2idx, idx2node = get_subgraph(adj_t, node)
+                        edge_pert = SpecPert(len(adj))
+                        modified_adj = edge_pert.update(adj)
+                        import ipdb; ipdb.set_trace()
                     # alpha1 = torch.sigmoid(model.alpha1)
                     # alpha2 = torch.sigmoid(model.alpha2)
                     # alpha3 = torch.sigmoid(model.alpha3)
