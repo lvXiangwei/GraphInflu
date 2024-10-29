@@ -22,30 +22,25 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--warmup', type=int, default=0)
 
-    ##### TODO
+
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--use_target", type=int, default=0) 
     parser.add_argument("--soft", type=int, default=0)
-    #### GCN
+   
     parser.add_argument("--hidden_dims", type=int, nargs='+', default=[1024, 64])
     parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--weight_decay", type=float, default=5e-5)
-    #less
-    ### step1 
+  
     parser.add_argument("--checkpoint_path", type=str, default='') 
     parser.add_argument("--save_step", type=int, default=50) 
-    
-    ### step2
     parser.add_argument("--checkpoint_epoch", type=int, default=15) 
     parser.add_argument("--proj_dim", type=int, nargs='+', default=[4096,]) 
     
-    ### step3
     parser.add_argument("--grad_source", type=int, default=0)
     parser.add_argument("--grad_target", type=int, default=0)
     
-    ### step5
     parser.add_argument("--use_source_score", type=int, default=0)
     parser.add_argument("--score_path", type=str, default="select-{}/{}/{}_influence_score.pt")
     parser.add_argument("--save_checkpoint", type=int, default=1)
@@ -62,8 +57,7 @@ def parse_args():
     parser.add_argument("--wandb", type=int, default=0)
     parser.add_argument("--wandb_info", type=str, default="")
 
-    ######
-    parser.add_argument('--K', type=int, default=5)
+    parser.add_argument('--K', type=int, default=1)
     args = parser.parse_args()
 
     return args

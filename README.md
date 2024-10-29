@@ -50,5 +50,10 @@ python -u main.py \
     --source_ratio 0.3 \
     --use_source_score 1 \
     --score_path score/acmv9/dblpv7_influence_score.pt \
+    --soft 1 \
 ```
-
+---
+##### Extra: Calculate custom contribution score
+```bash
+bash scripts/score.sh
+```

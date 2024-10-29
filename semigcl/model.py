@@ -3,7 +3,7 @@ from torch import nn
 from functools import partial
 import torch.nn.functional as F
 from torch.autograd import Function
-from .models import GraphSAGE, Predictor
+from .modules import GraphSAGE, Predictor
 from .layers import aggregator_lookup
 from .mvgrl import MVGRL
 from .utils import top_k_preds
@@ -31,13 +31,7 @@ class SemiGCL(nn.Module):
             # "device": device
         })
         self.cly_model = Predictor(num_class=num_class, inc=2*int(output_dims[-1]), temp=args.T)
-        # self.avg_group_centroid = None
-        
-        ### alpha1, alpha2, alpha3
-        self.alpha1 = nn.Parameter(torch.tensor(0.0))  
-        self.alpha2 = nn.Parameter(torch.tensor(0.0))  
-        self.alpha3 = nn.Parameter(torch.tensor(0.0))
-        
+              
         if args.cal_ssl:
             self.ssl_model = MVGRL(int(output_dims[-1]))
 

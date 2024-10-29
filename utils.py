@@ -20,7 +20,7 @@ def temp_seed(seed):
 def get_source_dataset(model, source, source_ratio=1.0, use_source_score=0, score_path=None, seed=200):
     '''
     return: 
-        source.source_mask: 指代用于train的数据
+        source.source_mask
     '''
     
     adj_s, adj_val_s, diff_idx_s, diff_val_s, feature_s, label_s, idx_train_s, _, _, idx_tot_s = load_data(dataset=f"{source}.mat", 
@@ -242,3 +242,69 @@ def GW_alg(Cs, Ct, beta=0.5, iteration=5, OT_iteration=20):
     Cgamma = Cst - 2 * torch.matmul(torch.matmul(Cs, gamma), Ct.transpose(1, 2))
     
     return gamma, Cgamma
+
+def normalize_adj_tensor(adj, sparse=False):
+    """Normalize adjacency tensor matrix.
+    """
+    # device = torch.device("cuda" if adj.is_cuda else "cpu")
+    # device = torch.device(device if adj.is_cuda else "cpu")
+    device = adj.device
+    mx = adj + torch.eye(adj.shape[0]).to(device)
+    rowsum = mx.sum(1)
+    r_inv = rowsum.pow(-1/2).flatten()
+    r_inv[torch.isinf(r_inv)] = 0.
+    r_mat_inv = torch.diag(r_inv)
+    mx = r_mat_inv @ mx
+    mx = mx @ r_mat_inv
+    return mx
+
+def get_subgraph(adj_list, target_node):
+    N, max_neighbors = adj_list.shape
+    one_hop_neighbors = set(adj_list[target_node].tolist()) - {target_node}
+    two_hop_neighbors = set()
+    for node in one_hop_neighbors:
+        neighbors = set(adj_list[node].tolist()) - {node} - one_hop_neighbors - {target_node}
+        two_hop_neighbors.update(neighbors)
+    subgraph_nodes = one_hop_neighbors | two_hop_neighbors | {target_node}
+    # print(subgraph_nodes)
+    n = len(subgraph_nodes)
+    node2idx = {node: i for i, node in enumerate(subgraph_nodes)}
+    idx2node = {i: node for i, node in enumerate(subgraph_nodes)}
+    adj_matrix = torch.zeros((n, n), dtype=torch.float32)
+    for node in subgraph_nodes:
+        cur_idx = node2idx[node]  # 当前节点的索引
+        for neighbor in adj_list[node]:
+            neighbor = neighbor.item()
+            if neighbor in node2idx:
+                ngh_idx = node2idx[neighbor]
+                adj_matrix[cur_idx, ngh_idx] = 1  # 添加邻接关系
+                adj_matrix[ngh_idx, cur_idx] = 1  # 对称化
+    return adj_matrix, node2idx, idx2node
+
+def get_adjlist(adj_matrix, idx2node, max_degree=32):
+    m = len(adj_matrix)
+    update_adjlst = dict()
+    for idx in range(m):
+        neibs = torch.nonzero(adj_matrix[idx]).squeeze(1).cpu().numpy()
+        if len(neibs) == 0:
+            neibs = np.array(idx).repeat(max_degree)
+        elif len(neibs) < max_degree:
+            neibs = np.random.choice(neibs, max_degree, replace=True)
+        else:
+            neibs = np.random.choice(neibs, max_degree, replace=False)
+        update_adjlst[idx2node[idx]] = list(idx2node[i] for i in neibs)
+    return update_adjlst
+
+def top_k_preds(y_true, y_pred):
+    # import ipdb; ipdb.set_trace()
+    top_k_list = np.array(np.sum(y_true, 1), np.int32)
+    predictions = []
+    for i in range(y_true.shape[0]):
+        pred_i = np.zeros(y_true.shape[1])
+        pred_i[np.argsort(y_pred[i, :])[-top_k_list[i]:]] = 1
+        predictions.append(np.reshape(pred_i, (1, -1)))
+    predictions = np.concatenate(predictions, axis=0)
+    top_k_array = np.array(predictions, np.int64)
+
+    return top_k_array
+

@@ -3,5 +3,4 @@ logs/
 scripts/
 grads/
 temp/
-collect_grads.py 
-match.py
+checkpoints/

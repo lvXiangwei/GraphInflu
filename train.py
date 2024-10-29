@@ -9,23 +9,11 @@ from semigcl.utils import batch_generator, adentropy
 import numpy as np
 import torch.nn.functional as F
 from semigcl.utils import eval_iterate
-from utils import calculate_gradient_penalty, normalize, disable_tracking_bn_stats, FGW_distance, prune
+from utils import normalize, FGW_distance, prune, normalize_adj_tensor, get_subgraph, get_adjlist
 from tqdm import tqdm
 from torch.nn.functional import normalize
 from sklearn.neighbors import KDTree
 
-def top_k_preds(y_true, y_pred):
-    # import ipdb; ipdb.set_trace()
-    top_k_list = np.array(np.sum(y_true, 1), np.int32)
-    predictions = []
-    for i in range(y_true.shape[0]):
-        pred_i = np.zeros(y_true.shape[1])
-        pred_i[np.argsort(y_pred[i, :])[-top_k_list[i]:]] = 1
-        predictions.append(np.reshape(pred_i, (1, -1)))
-    predictions = np.concatenate(predictions, axis=0)
-    top_k_array = np.array(predictions, np.int64)
-
-    return top_k_array
 
 def save_checkpoint(model, optimizer, epoch, checkpoint_path, loss):
     torch.save({
@@ -118,20 +106,6 @@ def test(name, model, data, cache_name, mask=None, cls_report=False, return_emb=
         accuracy, micro_f1, macro_f1 = evaluate(preds, labels)
         return accuracy, micro_f1, macro_f1
 
-def mme_loss(model, target_graph, lamda=0.5):
-    out = model(target_graph, reverse=True)[target_graph.test_mask]
-    out = F.softmax(out, dim=1)
-    return lamda * torch.mean(torch.sum(out * (torch.log(out + 1e-10)), dim=1))
-    
-
-def get_ssl_logits(model, z, zn):
-    g = torch.sigmoid(torch.mean(z, dim=0, keepdim=True))
-    pos_scores, neg_scores = model.disc(g, z, zn)
-    lbl_1 = torch.ones(pos_scores.size(0)).to(z.device)
-    lbl_2 = torch.zeros(neg_scores.size(0)).to(z.device)
-    loss = F.binary_cross_entropy_with_logits(pos_scores, lbl_1) + F.binary_cross_entropy_with_logits(neg_scores, lbl_2)
-    return loss
-
 def get_number_of_params(model):
     
     num_params = sum([p.numel()
@@ -186,8 +160,6 @@ def get_gradient(model, data, mask, optimizer):
     grads = normalize(grads, dim=1)
     return grads
 
-feat_source_warmup = []
-labels_source_warmup = []
 
 def accuracy(output, target, topk=(1,)):
     """Computes the precision@k for the specified values of k"""
@@ -205,58 +177,13 @@ def accuracy(output, target, topk=(1,)):
         
     return res
 
-def get_subgraph(adj_list, target_node):
-    N, max_neighbors = adj_list.shape
-    one_hop_neighbors = set(adj_list[target_node].tolist()) - {target_node}
-    two_hop_neighbors = set()
-    for node in one_hop_neighbors:
-        neighbors = set(adj_list[node].tolist()) - {node} - one_hop_neighbors - {target_node}
-        two_hop_neighbors.update(neighbors)
-    subgraph_nodes = one_hop_neighbors | two_hop_neighbors | {target_node}
-    # print(subgraph_nodes)
-    n = len(subgraph_nodes)
-    node2idx = {node: i for i, node in enumerate(subgraph_nodes)}
-    idx2node = {i: node for i, node in enumerate(subgraph_nodes)}
-    adj_matrix = torch.zeros((n, n), dtype=torch.float32)
-    for node in subgraph_nodes:
-        cur_idx = node2idx[node]  # 当前节点的索引
-        for neighbor in adj_list[node]:
-            neighbor = neighbor.item()
-            if neighbor in node2idx:
-                ngh_idx = node2idx[neighbor]
-                adj_matrix[cur_idx, ngh_idx] = 1  # 添加邻接关系
-                adj_matrix[cur_idx, ngh_idx] = 1  # 对称化
-    return adj_matrix, node2idx, idx2node
-
-def normalize_adj_tensor(adj, sparse=False, device='cuda:0'):
-    """Normalize adjacency tensor matrix.
-    """
-    # device = torch.device("cuda" if adj.is_cuda else "cpu")
-    device = torch.device(device if adj.is_cuda else "cpu")
-
-    if sparse:
-        # warnings.warn('If you find the training process is too slow, you can uncomment line 207 in deeprobust/graph/utils.py. Note that you need to install torch_sparse')
-        # TODO if this is too slow, uncomment the following code,
-        # but you need to install torch_scatter
-        # return normalize_sparse_tensor(adj)
-        adj = to_scipy(adj)
-        mx = normalize_adj(adj)
-        return sparse_mx_to_torch_sparse_tensor(mx).to(device)
-    else:
-        mx = adj + torch.eye(adj.shape[0]).to(device)
-        rowsum = mx.sum(1)
-        r_inv = rowsum.pow(-1/2).flatten()
-        r_inv[torch.isinf(r_inv)] = 0.
-        r_mat_inv = torch.diag(r_inv)
-        mx = r_mat_inv @ mx
-        mx = mx @ r_mat_inv
-    return mx
 
 class SpecPert(nn.Module):
-    def __init__(self, num_nodes):
-        super(SpecDis, self).__init__()
-        self.nnodes= num_nodes 
-        self.adj_changes = Parameter(torch.FloatTensor(int(nnodes*(nnodes-1)/2)))
+    def __init__(self, num_nodes, device):
+        super(SpecPert, self).__init__()
+        self.nnodes = num_nodes 
+        self.device = device
+        self.adj_changes = nn.Parameter(torch.FloatTensor(int(self.nnodes*(self.nnodes-1)/2))).to(self.device)
         nn.init.uniform_(self.adj_changes, 0.0, 0.001)
         
     def get_modifided_adj(self, adj):
@@ -267,24 +194,33 @@ class SpecPert(nn.Module):
         modifided_adj = m * (1 - adj) + (1 - m) * adj
         return modifided_adj    
 
-    def update(self, adj, steps=5, lr=50):
+    def update(self, adj, steps=1, lr=10.0):
+        # self.check_adj_tensor(adj)
+        adj = adj.to(self.device)
         ori_adj_norm = normalize_adj_tensor(adj)
         ori_e = torch.linalg.eigvals(ori_adj_norm)
         eigen_norm = self.norm = torch.norm(ori_e)
-        for i in range(steps):
-            self.loss = self(adj)
-            adj_grad = torch.autograd(self.loss, self.adj_chanes)[0]
-            lr = lr / torch.sqrt(t + 1)
+        for t in range(steps):
+            # self.loss = self(adj)
+            modifided_adj = self.get_modifided_adj(adj)
+            adj_norm = normalize_adj_tensor(modifided_adj) + 1e-5
+            e = torch.linalg.eigvals(adj_norm)
+            
+            eigen_mse = torch.norm(ori_e-e)
+            loss = eigen_mse / eigen_norm
+            
+            adj_grad = torch.autograd.grad(loss, self.adj_changes)[0]
+            lr = lr / np.sqrt(t + 1)
             self.adj_changes.data.add_(lr * adj_grad) 
             self.adj_changes.data.copy_(torch.clamp(self.adj_changes, min=0, max=1))
-        
+        # import ipdb; ipdb.set_trace()
         s = self.adj_changes.cpu().detach().numpy()
         s = np.random.binomial(1, s)
         self.adj_changes.data.copy_(torch.tensor(s))
         
         self.modifided_adj = self.get_modifided_adj(adj).detach()
-        self.check_adj_tensor(self.modified_adj)
-        return modifided_adj    
+        # self.check_adj_tensor(self.modifided_adj)
+        return self.modifided_adj    
     
     def check_adj_tensor(self, adj):
         """Check if the modified adjacency is symmetric, unweighted, all-zero diagonal.
@@ -296,14 +232,6 @@ class SpecPert(nn.Module):
         assert diag.max() == 0, "Diagonal should be 0!"
         assert diag.min() == 0, "Diagonal should be 0!"
          
-    def forward(self, adj):
-        modifided_adj = self.get_adj(adj)
-        adj_norm = normalize_adj_tensor(modifided_adj)
-        e = torch.linalg.eigvals(adj_norm)
-        eigen_mse = torch.norm(ori_e-e)
-        loss = eigen_mse / eigen_norm
-        
-
 
 def train_epoch(model, optimizer, source_data, target_data, epoch, epochs, args):
     model.train()
@@ -322,20 +250,25 @@ def train_epoch(model, optimizer, source_data, target_data, epoch, epochs, args)
             target_data["idx_train_t"], target_data["idx_val_t"], target_data["idx_test_t"], 
             target_data["idx_tot_t"]
         )
-        src_cs = None
+
+        num_batch = int(max(feature_s.shape[0]/(args.batch_size/2), idx_test_t.shape[0]/(args.batch_size/2)))
+        # import ipdb; ipdb.set_trace()
+        s_batches = batch_generator(idx_tot_s, int(args.batch_size/2))
+        s_batches2 = batch_generator(idx_train_s, int(args.batch_size/2))
+        t_batches = batch_generator(idx_test_t, int(args.batch_size/2))
+        model.train()
+        p = float(epoch) / args.epochs
+        grl_lambda = min(2. / (1. + np.exp(-10. * p)) - 1, 0.1) 
+
+
         if args.soft:
-            
-            # 1. 对每个target node 计算不确定性，不稳定性
-            # args.xi, args.eps, args.ip
             h = []
-            # import ipdb; ipdb.set_trace()
             with torch.no_grad():
                 model.eval()
                 for b_nodes in eval_iterate(idx_tot_t, 256):
                     h_per_batch, _,  = model(adj_t, adj_val_t, feature_t, label_t, diff_idx_t,
                                                             diff_val_t, b_nodes)
                     h.append(h_per_batch)
-                    # targets.append(targets_per_batch)
             ### uncertainty 
             h = torch.cat(h) #(N_t, D)
             h = h.detach()
@@ -347,91 +280,40 @@ def train_epoch(model, optimizer, source_data, target_data, epoch, epochs, args)
             # uncertainty
             uncertain_tgt = -1 * torch.sum(preds * torch.log(preds + 1e-10), dim=1).detach() # (N_t, )
             
-            
-            # # prepare random unit tensor
-            # delta_h = torch.rand(h.shape).sub(0.5).to(h.device)
-            # delta_h  = normalize(delta_h)
-            
-            # with disable_tracking_bn_stats(model):
-            #     for i in range(args.ip):
-            #         delta_h.requires_grad_()
-            #         preds_hat = model.cly_model(h + args.xi * delta_h)
-            #         logp_hat = F.log_softmax(preds_hat, dim=1)
-            #         kl_div = F.kl_div(logp_hat, preds, reduction='batchmean')
-            #         kl_div.backward()
-            #         delta_h = normalize(delta_h.grad)
-            #         model.zero_grad()
-                    
-            #     #calulate uncertainty
-            #     adv_h = delta_h * args.eps
-            #     preds_hat = model.cly_model(h + adv_h)
-            #     logp_hat = F.log_softmax(preds_hat, dim=1)
-            #     unstable_tgt = F.kl_div(logp_hat, preds, reduction='none').sum(1).detach() # (N_t, 1)
-            # unstable_tgt = torch.zeros(h_tgt.shape[0]).to(h.device)
-            # 2. 对每个source node
-            # 验证  uncertainty_tgt, unstable_tgt 取值在 [0， 1]范围内
-            # sorted_inx_s = torch.sort(idx_tot_s).values.cpu().numpy()
-            # src_idx_map = dict()
-            # for i in range(len(sorted_inx_s)):
-            #     src_idx_map[sorted_inx_s[i]] = i
-            # with torch.no_grad():
-            #     h = []
-            #     for b_nodes in eval_iterate(torch.sort(idx_tot_s).values, 256):
-            #         h_per_batch, _,  = model(adj_s, adj_val_s, feature_s, label_s, diff_idx_s,
-            #                                                 diff_val_s, b_nodes)
-            #         h.append(h_per_batch)
-            
-            # h_src = torch.cat(h).detach().cpu().numpy()
-                
         src_feat = torch.zeros(adj_s.shape[0], 128).to(args.device)
-        
-        num_batch = int(max(feature_s.shape[0]/(args.batch_size/2), idx_test_t.shape[0]/(args.batch_size/2)))
-        # import ipdb; ipdb.set_trace()
-        s_batches = batch_generator(idx_tot_s, int(args.batch_size/2))
-        s_batches2 = batch_generator(idx_train_s, int(args.batch_size/2))
-        t_batches = batch_generator(idx_test_t, int(args.batch_size/2))
-        model.train()
-        p = float(epoch) / args.epochs
-        grl_lambda = min(2. / (1. + np.exp(-10. * p)) - 1, 0.1) 
-        for iter in range(num_batch):
+
+        for iter in tqdm(range(num_batch)):
             b_nodes_s = next(s_batches) 
             b_nodes_2 = next(s_batches2)
             b_nodes_t = next(t_batches)
-            if len(b_nodes_s) == 0: ##### TODO, for source ratio
+            if len(b_nodes_s) == 0: 
                 cly_loss_s = 0.0
             else:
                 if args.soft:
-                    # score_lst = []
-                    # for i in b_nodes_s:
-                    #     score_lst.append(src_cs[src_idx_map[i.item()]])
-                    # score = torch.stack(score_lst)
+                    with torch.no_grad():
+                        model.eval()
+                        source_features, _ = model(adj_s, adj_val_s, feature_s, label_s, diff_idx_s,
+                                                        diff_val_s, idx=b_nodes_s)
+                        model.train()
                     
-                    ###
-                    source_features, _ = model(adj_s, adj_val_s, feature_s, label_s, diff_idx_s,
-                                                    diff_val_s, idx=b_nodes_s)
+                    src_feat[b_nodes_s] = source_features # updated src features
+                    # find K nearest target nodes 
+                    dist, ind = tree.query(source_features.detach().cpu().numpy(), k=args.K) 
+                    ind = torch.from_numpy(ind) # （B_s, K)
                     
-                    src_feat[b_nodes_s] = source_features
-                    dist, ind = tree.query(source_features.detach().cpu().numpy(), k=args.K) # (N_s, K), (N_s, K)
-                    ind = torch.from_numpy(ind) # （N_s, K)
-                    # dist = torch.from_numpy(dist).to(b_nodes_s.device) # （N_s, K)
-                    # import ipdb; ipdb.set_trace()
-                    
-                    
-                    ####### distance
+                    ### distance metrics
                     src_one_hop_neighbors = adj_s[b_nodes_s]
                     src_subgraph = torch.cat((b_nodes_s.unsqueeze(1), src_one_hop_neighbors), dim=1)
-                    src_subgraph_feat = src_feat[src_subgraph] # (N_s, neighbors + 1, hiden)
+                    src_subgraph_feat = src_feat[src_subgraph] # (B_s, N_neighbors, D)
                     K = args.K
                     B, N, D = src_subgraph_feat.shape
-                    src_subgraph_feat = src_subgraph_feat.unsqueeze(1).repeat(1, args.K, 1, 1) # (B, K, N + 1, D)
-                    src_subgraph_feat = F.normalize(src_subgraph_feat.view(B * K, N, D), p=2, dim=-1, eps=1e-12) # (B, K, N + 1, D)
-                    
+                    src_subgraph_feat = src_subgraph_feat.unsqueeze(1).repeat(1, K, 1, 1) # (B, K, N , D)
+                    src_subgraph_feat = F.normalize(src_subgraph_feat.view(B * K, N, D), p=2, dim=-1, eps=1e-12) # (B, K, N, D)
                     
                     tgt_one_hop_neighbors = adj_t[ind] # (B, K, N)
-                    tgt_subgraph = torch.cat((ind.unsqueeze(-1).to(args.device), tgt_one_hop_neighbors), dim=-1) # (B, K, N + 1, D)
-                    tgt_subgraph_feat = h[tgt_subgraph] # (B, K, N + 1, D)
-                    tgt_subgraph_feat = F.normalize(tgt_subgraph_feat.view(B * K, N, D), p=2, dim=-1, eps=1e-12) # (B, K, N + 1, D)
-                    
+                    tgt_subgraph = torch.cat((ind.unsqueeze(-1).to(args.device), tgt_one_hop_neighbors), dim=-1) # (B, K, N, D)
+                    tgt_subgraph_feat = h[tgt_subgraph] # (B, K, N, D)
+                    tgt_subgraph_feat = F.normalize(tgt_subgraph_feat.view(B * K, N, D), p=2, dim=-1, eps=1e-12) # (B, K, N, D)
                     
                     cosine_cost = 1 - torch.einsum(
                         'aij,ajk->aik', src_subgraph_feat, tgt_subgraph_feat.transpose(1, 2)) # (B * K, N, N)
@@ -445,41 +327,59 @@ def train_epoch(model, optimizer, source_data, target_data, epoch, epochs, args)
                     GW_loss, W_loss = FGW_distance(Css, Ctt, cosine_cost)
                     dis1 = GW_loss.reshape(B, K).mean(-1)
                     dis2 = W_loss.reshape(B, K).mean(-1)
-                    dis = dis1 + dis2 # (N)
+                    dis_metrics = (dis1 + dis2).detach() # (B)
                     
-                    ########### unstability 
-                    import ipdb; ipdb.set_trace()
-                    tgt_nodes = set(ind.flatten().tolist()) # (N_s, K)
+                    ### unstability 
+                    tgt_nodes = list(set(ind.flatten().tolist())) # (B_s, K)
                     uns_tgt = {i:0 for i in tgt_nodes}
                     for node in tgt_nodes:
-                        adj, node2idx, idx2node = get_subgraph(adj_t, node)
-                        edge_pert = SpecPert(len(adj))
+                        adj_t_temp = adj_t.clone()
+                        #### 2-hop subgraphs
+                        adj, _, idx2node = get_subgraph(adj_t, node)
+                        edge_pert = SpecPert(len(adj), args.device)
                         modified_adj = edge_pert.update(adj)
-                        import ipdb; ipdb.set_trace()
-                    # alpha1 = torch.sigmoid(model.alpha1)
-                    # alpha2 = torch.sigmoid(model.alpha2)
-                    # alpha3 = torch.sigmoid(model.alpha3)
-                    # phi1 = 1  / (1 + torch.exp((dist - alpha1))) # (N_s, K)
-                    # phi2 = 1 / (1 + torch.exp(torch.sigmoid(-uncertain_tgt[ind]) +  alpha2)) # (N_s, K)
-                    # phi3 = 1 / (1 + torch.exp(torch.sigmoid(- unstable_tgt[ind]) +  alpha3)) # (N_t, K)
-                    phi1 = 1  / (1 + torch.exp(-(dist - 0.4))) # (N_s, K)
-                    phi2 = 1 / (1 + torch.exp(torch.sigmoid(uncertain_tgt[ind]) -  0.6)) # (N_s, K)
-                    phi3 = 1 / (1 + torch.exp(torch.sigmoid(unstable_tgt[ind]) -  0.6)) # (N_t, K)
+                        update_adjlist = get_adjlist(modified_adj, idx2node)
+
+                        ### perturabate edges
+                        for key, val in update_adjlist.items():
+                            adj_t_temp[key].data[:] = torch.FloatTensor(val)
+
+                    with torch.no_grad():
+                        model.eval()
+                        h_hat, _ = model(adj_t_temp, adj_val_t, feature_t, label_t, diff_idx_t,
+                                                        diff_val_t, tgt_nodes)
+                        model.train()
+                    pred_ = preds[tgt_nodes]
+                    pred_hat_ = model.cly_model(h_hat)
+                    logp_hat = F.log_softmax(pred_hat_, dim=1)
+                    
+                    uns_metrics = torch.zeros(ind.shape[0]).to(args.device)
+                    uns_tgt = F.kl_div(logp_hat, pred_, reduction='none').sum(1).detach()
+                    
+                    mapping = {tgt:i for i, tgt in enumerate(tgt_nodes)}
+                    for i in range(len(ind)):
+                        for tgt in ind[i]:
+                            uns_metrics[i] += uns_tgt[mapping[tgt.item()]] / K
+                           
+                    ### uncertainty
+                    unc_metrics = uncertain_tgt[ind].mean(1)
+                    
+                    phi1 = 1  / (1 + torch.exp(-(dis_metrics - 0.4))) # (N_s, K)
+                    phi2 = 1 / (1 + torch.exp(torch.sigmoid(uns_metrics) -  0.6)) # (N_s, K)
+                    phi3 = 1 / (1 + torch.exp(torch.sigmoid(unc_metrics) -  0.6)) # (N_t, K)
                     
                     phi = torch.max(
                         torch.tensor(0.0),  
                         phi1 + torch.min(torch.tensor(1.0), phi2 + phi3) - 2.0 + 1.0 
                     )
-                    # score  = 0.5 * (1 + (1 + 1/(1 + alpha1) + alpha2 + alpha3) * torch.mean(phi, dim=1) ) 
-                    score  = 0.5 * (1 + torch.mean(phi, dim=1))
-                    # print(phi1[0][:3].detach().cpu().numpy(), phi2[0][:3].detach().cpu().numpy(), phi3[0][:3].detach().cpu().numpy(), phi[0][:3].detach().cpu().numpy(), score[:3].detach().cpu().numpy())
-                    # print(alpha1.item(), alpha2.item(), alpha3.item(), score[:3].detach().cpu().numpy())
+                    score  = 0.5 * (1 + phi)
                 else:
                     score = None
+             
                 source_features, cly_loss_s = model(adj_s, adj_val_s, feature_s, label_s, diff_idx_s,
                                                     diff_val_s, idx=b_nodes_s, src_cs=score) # (bs, output_dim), scalar, task_loss
 
-            ### TODO, b_nodes_t 似乎应该从idx_tot_t
+            ### TODO
             target_features, _ = model(adj_t, adj_val_t, feature_t, label_t, diff_idx_t,
                                                     diff_val_t, idx=b_nodes_t)
             
@@ -547,13 +447,12 @@ def train_epoch(model, optimizer, source_data, target_data, epoch, epochs, args)
                     })
 
             optimizer.zero_grad()
-            # print(epoch)
-            # import ipdb; ipdb.set_trace()
             loss.backward()
             optimizer.step()
 
             if args.save_checkpoint and epoch % args.save_step == 0:
                 save_checkpoint(model, optimizer, epoch, args.checkpoint_path, loss)
+
 
 def train(model, optimizer, source_data, target_data, epochs, args, logger):
     model = model.to(args.device)
@@ -579,15 +478,9 @@ def train(model, optimizer, source_data, target_data, epochs, args, logger):
     best_model = model
 
     for epoch in range(1, epochs + 1):
-        # import ipdb; ipdb.set_trace()
-        # if args.model == "UDAGCN":
         train_epoch(model, optimizer, source_data, target_data, epoch, epochs, args)
-        # import ipdb; ipdb.set_trace()
         s_accuracy, s_micro_f1, s_macro_f1 = test(args.model, model, source_data, "source")
         if args.model == "SemiGCL":
-            # if epoch % 10 == 0:
-            #     return_emb = True
-            # else:
             return_emb = False
             t_accuracy, t_micro_f1, t_macro_f1 = test(args.model, model, target_data, "target", return_emb=return_emb, info=f"epoch_{epoch}")
         
@@ -621,7 +514,6 @@ def train(model, optimizer, source_data, target_data, epochs, args, logger):
                 "Best/Macro-F1": best_target_macro_f1
             })
 
-            
             
     logger.info("=============================================================")
     line = "{} - Epoch: {}, best_source_acc: {}, best_target_acc: {}, best_target_micro_f1: {}, best_target_macro_f1: {}"\
