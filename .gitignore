@@ -1,6 +1,5 @@
 __pycache__/
 logs/
-scripts/
 grads/
 temp/
 checkpoints/
